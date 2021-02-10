@@ -128,7 +128,7 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePieces() const {
   #pragma omp parallel for schedule(static)
   for (int64_t i = 0; i < size_sent; ++i) {
     const int tid = omp_get_thread_num();
-    auto w = sentences_[i];
+    const auto& w = sentences_[i];
     const auto ut = string_util::UTF8ToUnicodeText(
         pretokenizer ? pretokenizer->PreTokenize(w.first) : w.first);
     int64_t last_j = -1;
