@@ -172,8 +172,8 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePieces() const {
         substring_freq_mt[tid][string_util::UnicodeTextToUTF8(uw)] += 1;
       }
     }
-    if (counts[tid] % 100000 == 0) {
-      LOG(INFO) << "thread "  << tid << " finish " << counts[tid] << " lines.";
+    if (counts[tid] % 1000000 == 0) {
+      LOG(INFO) << "thread "  << tid << " finished " << counts[tid] << " lines.";
     }
   }
   LOG(INFO) << "merge results ...";
@@ -187,6 +187,7 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePieces() const {
       substring_freq_mt[0][it.first] += it.second;
     }
     substring_freq_mt[tid].clear();
+    LOG(INFO) << "finised merge from thread " << tid;
   }
 
   auto& all_chars = all_chars_mt[0];

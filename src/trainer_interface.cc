@@ -540,14 +540,28 @@ END:
 void TrainerInterface::SplitSentencesByWhitespace() {
   LOG(INFO) << "Tokenizing input sentences with whitespace: "
             << sentences_.size();
-  absl::flat_hash_map<std::string, int64> tokens;
-  for (const auto &s : sentences_) {
+  int num_threads = 1;
+  #pragma omp parallel
+  #pragma omp master
+  { num_threads = omp_get_num_threads(); }
+  int64_t size_sent = sentences_.size();
+  std::vector< absl::flat_hash_map<std::string, int64> > tokens_mt(num_threads);
+  #pragma omp parallel for schedule(static)
+  for (int64_t i = 0; i < size_sent; ++i) {
+    const int tid = omp_get_thread_num(); 
+    const auto& s = sentences_[i];
     for (const auto &w :
          SplitIntoWords(s.first, trainer_spec_.treat_whitespace_as_suffix())) {
-      tokens[std::string(w)] += s.second;
+      tokens_mt[tid][std::string(w)] += s.second;
     }
   }
-  sentences_ = Sorted(tokens);
+  for(int i = 1; i < num_threads; ++i){
+    for(auto& it: tokens_mt[i]){
+      tokens_mt[0][it.first] += it.second;
+    }
+    tokens_mt[i].clear();
+  }
+  sentences_ = Sorted(tokens_mt[0]);
   LOG(INFO) << "Done! " << sentences_.size();
 }
 
