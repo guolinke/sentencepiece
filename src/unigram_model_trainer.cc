@@ -122,12 +122,14 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePieces() const {
 
   std::vector< absl::flat_hash_map<std::string, int64> > all_chars_mt(num_threads);
   std::vector< absl::flat_hash_map<std::string, int64> > substring_freq_mt(num_threads);
+  std::vector<int64_t> counts(num_threads, 0);
 
   int64_t size_sent = sentences_.size();
 
   #pragma omp parallel for schedule(static)
   for (int64_t i = 0; i < size_sent; ++i) {
     const int tid = omp_get_thread_num();
+    counts[tid] += 1;
     const auto& w = sentences_[i];
     const auto ut = string_util::UTF8ToUnicodeText(
         pretokenizer ? pretokenizer->PreTokenize(w.first) : w.first);
@@ -140,13 +142,15 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePieces() const {
       }
       if (c == kWSChar) {
         if (last_j >= 0) {
-          for (int64_t k = last_j; k < j; ++k) {
-            for (int64_t kk = k + 2; kk < j; ++kk) {
-              const char32 *begin = &ut[0] + k;
-              const char32 *end = &ut[0] + kk;
-              UnicodeText uw(begin, end);
+          // UnicodeText tmp(&ut[0] + last_j, &ut[0] + j);
+          for (int64_t s = last_j; s <= j - 2; ++s) {
+            UnicodeText uw;
+            uw.reserve(j - last_j);
+            uw.push_back(ut[s]);
+            for (int64_t e = s + 1; e < j; ++e) {
+              uw.push_back(ut[e]);
               if (!IsValidSentencePiece(uw)) {
-                continue;
+                break;
               }
               substring_freq_mt[tid][string_util::UnicodeTextToUTF8(uw)] += 1;
             }
@@ -156,16 +160,20 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePieces() const {
       }
       ++j;
     }
-    for (int64_t k = last_j; k < j; ++k) {
-      for (int64_t kk = k + 2; kk < j; ++kk) {
-        const char32 *begin = &ut[0] + k;
-        const char32 *end = &ut[0] + kk;
-        UnicodeText uw(begin, end);
+    for (int64_t s = last_j; s <= j - 2; ++s) {
+      UnicodeText uw;
+      uw.reserve(j - last_j);
+      uw.push_back(ut[s]);
+      for (int64_t e = s + 1; e < j; ++e) {
+        uw.push_back(ut[e]);
         if (!IsValidSentencePiece(uw)) {
-          continue;
+          break;
         }
         substring_freq_mt[tid][string_util::UnicodeTextToUTF8(uw)] += 1;
       }
+    }
+    if (counts[tid] % 100000 == 0) {
+      LOG(INFO) << "thread "  << tid << " finish " << counts[tid] << " lines.";
     }
   }
   LOG(INFO) << "merge results ...";
@@ -180,8 +188,15 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePieces() const {
     }
     substring_freq_mt[tid].clear();
   }
+
   auto& all_chars = all_chars_mt[0];
   auto& substring_freq = substring_freq_mt[0];
+
+  // calc the coverage of sub strings.
+  for(auto& p : substring_freq) {
+    const auto len = p.first.size();
+    p.second *= len;
+  }
 
   LOG(INFO) << "total substring " << substring_freq.size();
   LOG(INFO) << "total chars " << all_chars.size();
@@ -194,7 +209,6 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePieces() const {
 
   // Sort by the coverage of sub strings.
   for (const auto &p : Sorted(substring_freq)) {
-    const auto len = p.first.size();
     const auto uw = string_util::UTF8ToUnicodeText(p.first);
     if (!IsValidSentencePiece(uw)) {
       continue;
@@ -205,7 +219,7 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePieces() const {
       break;
     }
     CHECK(!port::ContainsKey(all_chars, w));
-    seed_sentencepieces.emplace_back(w, p.second * len);
+    seed_sentencepieces.emplace_back(w, p.second);
   }
 
   ToLogProb(seed_sentencepieces.begin(), seed_sentencepieces.end());
