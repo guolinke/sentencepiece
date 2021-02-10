@@ -37,6 +37,8 @@
 #include "unicode_script.h"
 #include "util.h"
 
+#include <omp.h>
+
 namespace sentencepiece {
 
 const char32 TrainerInterface::kWSChar = L'\u2581';
@@ -409,6 +411,8 @@ END:
       }
     }
 
+    LOG(INFO) << "Check spaces";
+
     for (size_t i = 0; i < sentences_.size(); ++i) {
       auto *s = &sentences_[i].first;
       CHECK_OR_RETURN(s->find(" ") == std::string::npos)
@@ -420,21 +424,31 @@ END:
     }
   }
 
-  // Count character frequencies.
-  int64 all_chars_count = 0;
+  LOG(INFO) << "count chars";
+
+  int num_threads = 1;
+  #pragma omp parallel
+  #pragma omp master
+  { num_threads = omp_get_num_threads(); }
+
   // A map from a character to {is_required_char, character count}.
-  absl::flat_hash_map<char32, std::pair<bool, int64>> chars_count;
-  for (const char32 c :
-       string_util::UTF8ToUnicodeText(trainer_spec_.required_chars())) {
-    CHECK_OR_RETURN(string_util::IsValidCodepoint(c));
-    if (c == 0x0000) {
-      LOG(INFO) << "Found null character. The required_chars field must be "
-                   "encoded in utf-8.";
-      continue;
-    }
-    chars_count[c].first = true;  // is_required_character.
-  }
-  for (const auto &w : sentences_) {
+  std::vector<int64> all_chars_count_mt(num_threads);
+  std::vector< absl::flat_hash_map<char32, int64> > chars_count_mt(num_threads);
+  // for (const char32 c :
+  //      string_util::UTF8ToUnicodeText(trainer_spec_.required_chars())) {
+  //   CHECK_OR_RETURN(string_util::IsValidCodepoint(c));
+  //   if (c == 0x0000) {
+  //     LOG(INFO) << "Found null character. The required_chars field must be "
+  //                  "encoded in utf-8.";
+  //     continue;
+  //   }
+  //   chars_count[c].first = true;  // is_required_character.
+  // }
+  int64_t size_sent = sentences_.size();
+  #pragma omp parallel for schedule(static)
+  for (int64_t i = 0; i < size_sent; ++i) {
+    const int tid = omp_get_thread_num(); 
+    const auto& w = sentences_[i];
     for (const char32 c : string_util::UTF8ToUnicodeText(w.first)) {
       if (!string_util::IsValidCodepoint(c)) continue;
       if (c == 0x0000) {
@@ -445,14 +459,23 @@ END:
       if (c == 0x0020) {
         // UTF8ToUnicodeText returns a white space if the text
         // contains an interchange-invalid character.
-        CHECK_OR_RETURN(w.first.find(" ") == std::string::npos)
+        LOG(INFO)
             << "space must not be included in normalized string.";
         continue;
       }
-      chars_count[c].second += w.second;
-      all_chars_count += w.second;
+      chars_count_mt[tid][c] += w.second;
+      all_chars_count_mt[tid] += w.second;
     }
   }
+  for (int i = 1; i < num_threads; ++i) {
+    for(auto & p: chars_count_mt[i]) {
+      chars_count_mt[0][p.first] += p.second;
+    }
+    chars_count_mt[i].clear();
+    all_chars_count_mt[0] += all_chars_count_mt[i];
+  }
+  auto all_chars_count = all_chars_count_mt[0];
+  auto& chars_count = chars_count_mt[0];
   LOG(INFO) << "all chars count=" << all_chars_count;
 
   // Determines required_chars which must be included in the vocabulary.
@@ -467,11 +490,11 @@ END:
       LOG(INFO) << "Done: " << 100.0 * coverage << "% characters are covered.";
       break;
     }
-    accumulated_chars_count += w.second.second;
+    accumulated_chars_count += w.second;
     CHECK_NE_OR_RETURN(w.first, 0x0020)
         << "space must not be included in normalized string.";
     if (w.first == kUPPBoundaryChar) continue;  // Tab is not included.
-    required_chars_.emplace(w.first, w.second.second);
+    required_chars_.emplace(w.first, w.second);
   }
 
   LOG(INFO) << "Alphabet size=" << required_chars_.size();
@@ -482,7 +505,9 @@ END:
 
   // Replaces rare characters (characters not included in required_chars_)
   // with kUNKChar.
-  for (auto &w : sentences_) {
+  #pragma omp parallel for schedule(static)
+  for (int64_t i = 0; i < size_sent; ++i) {
+    auto& w = sentences_[i];
     string_util::UnicodeText uw2;
     for (const char32 c : string_util::UTF8ToUnicodeText(w.first)) {
       if (port::ContainsKey(required_chars_, c)) {
