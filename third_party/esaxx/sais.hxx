@@ -34,6 +34,8 @@
 //#define __builtin_vsnprintf(a, b, c, d) __builtin_vsnprintf(a, b, c, (char *)d)
 #endif
 
+#undef _OPENMP
+
 #include <iterator>
 #ifdef _OPENMP
 # include <omp.h>
@@ -360,6 +362,7 @@ typedef typename std::iterator_traits<string_type>::value_type char_type;
   return pidx;
 }
 
+#define _OPENMP
 
 #endif /* __cplusplus */
 #endif /* _SAIS_HXX */

@@ -112,7 +112,6 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePieces() const {
   // Merges all sentences into one array with 0x0000 delimiter.
   //std::vector<char32> array;
   constexpr char32 kSentenceBoundary = 0x0000;
-  const char32 kWSChar = L'\u2581';
   int num_threads = 1;
   #pragma omp parallel
   #pragma omp master
@@ -120,64 +119,73 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePieces() const {
 
   LOG(INFO) << "num_threads  " << num_threads;
 
-  std::vector< absl::flat_hash_map<std::string, int64> > all_chars_mt(num_threads);
-  std::vector< absl::flat_hash_map<std::string, int64> > substring_freq_mt(num_threads);
-  std::vector<int64_t> counts(num_threads, 0);
-
   int64_t size_sent = sentences_.size();
-
-  #pragma omp parallel for schedule(static)
-  for (int64_t i = 0; i < size_sent; ++i) {
-    const int tid = omp_get_thread_num();
-    counts[tid] += 1;
-    const auto& w = sentences_[i];
-    const auto ut = string_util::UTF8ToUnicodeText(
-        pretokenizer ? pretokenizer->PreTokenize(w.first) : w.first);
-    int64_t last_j = -1;
-    int64_t j = 0;
-    for (const auto &c : ut) {
-      //array.push_back(c);
-      if (c != kUNKChar && c != kSentenceBoundary) {
-        all_chars_mt[tid][string_util::UnicodeCharToUTF8(c)] += w.second;
-      }
-      if (c == kWSChar) {
-        if (last_j >= 0) {
-          // UnicodeText tmp(&ut[0] + last_j, &ut[0] + j);
-          for (int64_t s = last_j; s <= j - 2; ++s) {
-            UnicodeText uw;
-            uw.reserve(j - last_j);
-            uw.push_back(ut[s]);
-            for (int64_t e = s + 1; e < j; ++e) {
-              uw.push_back(ut[e]);
-              if (!IsValidSentencePiece(uw)) {
-                break;
-              }
-              substring_freq_mt[tid][string_util::UnicodeTextToUTF8(uw)] += 1;
-            }
-          }
+  int64_t min_block_size = 500000;
+  int num_block = std::min<int>(num_threads, (size_sent + min_block_size - 1) / min_block_size);
+  num_block = std::max<int>(1, num_block);
+  int64_t block_size = (size_sent + num_block - 1) / num_block;
+  std::vector<absl::flat_hash_map<std::string, int64>> all_chars_mt(num_block);
+  std::vector<absl::flat_hash_map<std::string, int64>> substring_freq_mt(
+      num_block);
+  std::vector<int64_t> counts(num_block, 0);
+#pragma omp parallel for schedule(static, 1)
+  for (int64_t tid = 0; tid < num_block; ++tid) {
+    std::vector<char32> array;
+    int64_t s_start = tid * block_size;
+    int64_t s_end = std::min(size_sent, s_start + block_size);
+    for (int64_t i = s_start; i < s_end; ++i) {
+      counts[tid] += 1;
+      const auto &w = sentences_[i];
+      const auto ut = string_util::UTF8ToUnicodeText(
+          pretokenizer ? pretokenizer->PreTokenize(w.first) : w.first);
+      for (int64_t j = 0; j < ut.size(); ++j) {
+        const auto &c = ut[j];
+        array.push_back(c);
+        if (c != kUNKChar && c != kSentenceBoundary) {
+          all_chars_mt[tid][string_util::UnicodeCharToUTF8(c)] += w.second;
         }
-        last_j = j;
       }
-      ++j;
-    }
-    for (int64_t s = last_j; s <= j - 2; ++s) {
-      UnicodeText uw;
-      uw.reserve(j - last_j);
-      uw.push_back(ut[s]);
-      for (int64_t e = s + 1; e < j; ++e) {
-        uw.push_back(ut[e]);
-        if (!IsValidSentencePiece(uw)) {
-          break;
-        }
-        substring_freq_mt[tid][string_util::UnicodeTextToUTF8(uw)] += 1;
+      if (counts[tid] % 1000000 == 0) {
+        LOG(INFO) << "thread " << tid << " finished " << counts[tid]
+                  << " lines.";
       }
     }
-    if (counts[tid] % 1000000 == 0) {
-      LOG(INFO) << "thread "  << tid << " finished " << counts[tid] << " lines.";
+    LOG(INFO) << "Making suffix array for thread " << tid;
+    const node_int_type n = array.size();
+    std::vector<node_int_type> SA(n);  // suffix array
+    std::vector<node_int_type> L(n);   // left boundaries of internal node
+    std::vector<node_int_type> R(n);   // right boundaries of internal node
+    std::vector<node_int_type> D(n);   // depths of internal node
+    constexpr node_int_type kAlphabetSize = 0x110000;  // All UCS4 range.
+    node_int_type node_num = 0;
+    CHECK_EQ(0, esaxx(array.begin(), SA.begin(), L.begin(), R.begin(),
+                      D.begin(), n, kAlphabetSize, node_num));
+    LOG(INFO) << "Extracting frequent sub strings for thread " << tid;
+    for (node_int_type i = 0; i < node_num; ++i) {
+      const node_int_type offset = SA[L[i]];
+      const node_int_type len = D[i];
+      if (len <= 1) {
+        continue;
+      }
+      const char32 *begin = &array[0] + offset;
+      const char32 *end = &array[0] + offset + len;
+      const UnicodeText uw(begin, end);
+      const std::string w = string_util::UnicodeTextToUTF8(uw);
+      // Skips if a substring contains a sentence boundary.
+      if (std::find(begin, end, kSentenceBoundary) != end) {
+        continue;
+      }
+      if (!IsValidSentencePiece(uw)) {
+        continue;
+      }
+      // character-wise coverage is the default score.
+      const node_int_type freq = R[i] - L[i];
+      const node_int_type score = freq * len;
+      substring_freq_mt[tid][w] += score;
     }
   }
   LOG(INFO) << "merge results ...";
-  for(int tid = 1; tid < num_threads; ++tid){
+  for (int tid = 1; tid < num_block; ++tid) {
     for(const auto &it : all_chars_mt[tid]){
       all_chars_mt[0][it.first] += it.second;
     }
@@ -191,13 +199,9 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePieces() const {
   }
 
   auto& all_chars = all_chars_mt[0];
-  auto& substring_freq = substring_freq_mt[0];
-
-  // calc the coverage of sub strings.
-  for(auto& p : substring_freq) {
-    const auto len = p.first.size();
-    p.second *= len;
-  }
+  auto &substring_freq = substring_freq_mt[0];
+  //absl::flat_hash_map < std::string, int64> substring_freq;
+  //substring_freq_mt.clear();
 
   LOG(INFO) << "total substring " << substring_freq.size();
   LOG(INFO) << "total chars " << all_chars.size();
