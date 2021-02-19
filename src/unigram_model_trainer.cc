@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.!
 
+#include "unigram_model_trainer.h"
+
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
@@ -21,8 +23,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <cstdio>
-#include <iostream>
 
 #include "normalizer.h"
 #include "pretokenizer_for_training.h"
@@ -31,10 +31,7 @@
 #include "third_party/absl/memory/memory.h"
 #include "third_party/esaxx/esa.hxx"  // Suffix array library.
 #include "unicode_script.h"
-#include "unigram_model_trainer.h"
 #include "util.h"
-
-#include <omp.h>
 
 namespace sentencepiece {
 namespace unigram {
@@ -110,101 +107,103 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePieces() const {
   const auto *pretokenizer = SentencePieceTrainer::GetPretokenizerForTraining();
 
   // Merges all sentences into one array with 0x0000 delimiter.
-  //std::vector<char32> array;
+  std::vector<char32> array;
+  std::vector<int64_t> freqs;
+  absl::flat_hash_map<std::string, int64> all_chars;
+  absl::flat_hash_map<std::string, int64> all_substrs;
   constexpr char32 kSentenceBoundary = 0x0000;
-  int num_threads = 1;
-  #pragma omp parallel
-  #pragma omp master
-  { num_threads = omp_get_num_threads(); }
-
-  LOG(INFO) << "num_threads  " << num_threads;
-
-  int64_t size_sent = sentences_.size();
-  int64_t min_block_size = 500000;
-  int num_block = std::min<int>(num_threads, (size_sent + min_block_size - 1) / min_block_size);
-  num_block = std::max<int>(1, num_block);
-  int64_t block_size = (size_sent + num_block - 1) / num_block;
-  std::vector<absl::flat_hash_map<std::string, int64>> all_chars_mt(num_block);
-  std::vector<absl::flat_hash_map<std::string, int64>> substring_freq_mt(
-      num_block);
-  std::vector<int64_t> counts(num_block, 0);
-#pragma omp parallel for schedule(static, 1)
-  for (int64_t tid = 0; tid < num_block; ++tid) {
-    std::vector<char32> array;
-    int64_t s_start = tid * block_size;
-    int64_t s_end = std::min(size_sent, s_start + block_size);
-    for (int64_t i = s_start; i < s_end; ++i) {
-      counts[tid] += 1;
-      const auto &w = sentences_[i];
-      const auto ut = string_util::UTF8ToUnicodeText(
-          pretokenizer ? pretokenizer->PreTokenize(w.first) : w.first);
-      for (int64_t j = 0; j < ut.size(); ++j) {
-        const auto &c = ut[j];
-        array.push_back(c);
-        if (c != kUNKChar && c != kSentenceBoundary) {
-          all_chars_mt[tid][string_util::UnicodeCharToUTF8(c)] += w.second;
+  const char32 kWordBoundary = 0x000A;
+  const bool is_tsv = trainer_spec_.input_format() == "tsv";
+  for (const auto &w : sentences_) {
+    const auto ut = string_util::UTF8ToUnicodeText(
+        pretokenizer ? pretokenizer->PreTokenize(w.first) : w.first);
+    bool is_valid = IsValidSentencePiece(ut);
+    const auto freq = is_valid ? w.second : w.second / 2;
+    for (const auto &c : ut) {
+      array.push_back(c);
+      freqs.push_back(std::max<int64_t>(1, freq));
+      if (c != kUNKChar && c != kSentenceBoundary) {
+        all_chars[string_util::UnicodeCharToUTF8(c)] += w.second;
+      }
+    }
+    if (is_tsv) {
+      if (!is_valid) {
+        if (freq > 0) {
+          for (const auto &c : ut) {
+            array.push_back(c);
+            freqs.push_back(freq);
+          }
+        }
+      } else {
+        if (freq > 1) {
+          all_substrs[w.first] += freq * w.first.size();
         }
       }
-      if (counts[tid] % 1000000 == 0) {
-        LOG(INFO) << "thread " << tid << " finished " << counts[tid]
-                  << " lines.";
-      }
-    }
-    LOG(INFO) << "Making suffix array for thread " << tid;
-    const node_int_type n = array.size();
-    std::vector<node_int_type> SA(n);  // suffix array
-    std::vector<node_int_type> L(n);   // left boundaries of internal node
-    std::vector<node_int_type> R(n);   // right boundaries of internal node
-    std::vector<node_int_type> D(n);   // depths of internal node
-    constexpr node_int_type kAlphabetSize = 0x110000;  // All UCS4 range.
-    node_int_type node_num = 0;
-    CHECK_EQ(0, esaxx(array.begin(), SA.begin(), L.begin(), R.begin(),
-                      D.begin(), n, kAlphabetSize, node_num));
-    LOG(INFO) << "Extracting frequent sub strings for thread " << tid;
-    for (node_int_type i = 0; i < node_num; ++i) {
-      const node_int_type offset = SA[L[i]];
-      const node_int_type len = D[i];
-      if (len <= 1) {
-        continue;
-      }
-      const char32 *begin = &array[0] + offset;
-      const char32 *end = &array[0] + offset + len;
-      const UnicodeText uw(begin, end);
-      const std::string w = string_util::UnicodeTextToUTF8(uw);
-      // Skips if a substring contains a sentence boundary.
-      if (std::find(begin, end, kSentenceBoundary) != end) {
-        continue;
-      }
-      if (!IsValidSentencePiece(uw)) {
-        continue;
-      }
-      // character-wise coverage is the default score.
-      const node_int_type freq = R[i] - L[i];
-      const node_int_type score = freq * len;
-      substring_freq_mt[tid][w] += score;
+      array.push_back(kWordBoundary);
+      freqs.push_back(std::max<int64_t>(1, freq));
     }
   }
-  LOG(INFO) << "merge results ...";
-  for (int tid = 1; tid < num_block; ++tid) {
-    for(const auto &it : all_chars_mt[tid]){
-      all_chars_mt[0][it.first] += it.second;
-    }
-    all_chars_mt[tid].clear();
 
-    for(const auto &it : substring_freq_mt[tid]){
-      substring_freq_mt[0][it.first] += it.second;
+  CHECK_LE(array.size(),
+           static_cast<size_t>(std::numeric_limits<node_int_type>::max()))
+      << "Input corpus too large, try with train_extremely_large_corpus=true";
+  const node_int_type n = array.size();
+
+  std::vector<node_int_type> SA(n);  // suffix array
+  std::vector<node_int_type> L(n);   // left boundaries of internal node
+  std::vector<node_int_type> R(n);   // right boundaries of internal node
+  std::vector<node_int_type> D(n);   // depths of internal node
+
+  // Makes a suffix array to extract all sub strings occurring
+  // more than 2 times in the sentence.
+  constexpr node_int_type kAlphabetSize = 0x110000;  // All UCS4 range.
+  node_int_type node_num = 0;
+  LOG(INFO) << "Making suffix array...";
+  CHECK_EQ(0, esaxx(array.begin(), SA.begin(), L.begin(), R.begin(), D.begin(),
+                    n, kAlphabetSize, node_num));
+  LOG(INFO) << "Extracting frequent sub strings...";
+  std::vector<std::pair<node_int_type, node_int_type>> substr_index;
+  for (node_int_type i = 0; i < node_num; ++i) {
+    node_int_type offset = SA[L[i]];
+    node_int_type len = D[i];
+    if (is_tsv) {
+      if (array[offset] == kWordBoundary) {
+        offset += 1;
+        len -= 1;
+      }
+      if (array[offset + len - 1] == kWordBoundary) {
+        len -= 1;
+      }
     }
-    substring_freq_mt[tid].clear();
-    LOG(INFO) << "finised merge from thread " << tid;
+    if (len <= 1) {
+      continue;
+    }
+    const char32 *begin = &array[0] + offset;
+    const char32 *end = &array[0] + offset + len;
+    // Skips if a substring contains a sentence boundary.
+    if (std::find(begin, end, kSentenceBoundary) != end) {
+      continue;
+    }
+    if (std::find(begin, end, kWordBoundary) != end) {
+      continue;
+    }
+    const UnicodeText uw(begin, end);
+    if (!IsValidSentencePiece(uw)) {
+      continue;
+    }
+    // character-wise coverage is the default score.
+    node_int_type freq = 0;
+    if (is_tsv) {
+      for (int64_t k = L[i]; k < R[i]; ++k) {
+        freq += freqs[SA[k]];
+      }
+    } else {
+      freq += R[i] - L[i];
+    }
+    const node_int_type score = freq * len;
+    const std::string w = string_util::UnicodeTextToUTF8(uw);
+    all_substrs[w] += score;
   }
-
-  auto& all_chars = all_chars_mt[0];
-  auto &substring_freq = substring_freq_mt[0];
-  //absl::flat_hash_map < std::string, int64> substring_freq;
-  //substring_freq_mt.clear();
-
-  LOG(INFO) << "total substring " << substring_freq.size();
-  LOG(INFO) << "total chars " << all_chars.size();
 
   // all_chars must be included in the seed sentencepieces.
   TrainerModel::SentencePieces seed_sentencepieces;
@@ -213,12 +212,8 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePieces() const {
   }
 
   // Sort by the coverage of sub strings.
-  for (const auto &p : Sorted(substring_freq)) {
-    const auto uw = string_util::UTF8ToUnicodeText(p.first);
-    if (!IsValidSentencePiece(uw)) {
-      continue;
-    }
-    const std::string w = string_util::UnicodeTextToUTF8(uw);
+  for (const auto &p : Sorted(all_substrs)) {
+    const std::string w = p.first;
     if (seed_sentencepieces.size() ==
         static_cast<size_t>(trainer_spec_.seed_sentencepiece_size())) {
       break;
